@@ -1,3 +1,13 @@
+// author modification:  kaibs kai.b.schneider@gmail.com
+// date:                 20190739
+//
+// modified version to directly exexcute jogging-commands in RViz
+// when fake_controller is used, commands on topics jog_arm_server/delta_jog_cmds and
+// jog_arm_server/joint_delta_jog_cmds are directly feeded into the trajectory_execution_manager
+//
+// changes only in  includes, lines 82-94 and lines 154-160
+
+
 ///////////////////////////////////////////////////////////////////////////////
 //      Title     : jog_ros_interface.cpp
 //      Project   : jog_arm
@@ -41,6 +51,14 @@
 
 #include <jog_arm/jog_ros_interface.h>
 
+
+// additional includes for direct pubblishing and executing
+#include <moveit/trajectory_execution_manager/trajectory_execution_manager.h>
+#include <tf2_ros/transform_listener.h>
+#include <moveit/planning_scene_monitor/current_state_monitor.h>
+#include <memory>
+
+
 namespace jog_arm
 {
 /////////////////////////////////////////////////////////////////////////////////
@@ -61,7 +79,21 @@ JogROSInterface::JogROSInterface()
     exit(EXIT_FAILURE);
 
   // Load the robot model. This is used by the worker threads.
+
+  // START MODIFIED #################################################################
+  
+  // initialize necessary components for pub&exec
+  auto tfBuffer = std::make_shared<tf2_ros::Buffer>();
+  tf2_ros::TransformListener tfListener(*tfBuffer);
+  
   model_loader_ptr_ = std::shared_ptr<robot_model_loader::RobotModelLoader>(new robot_model_loader::RobotModelLoader);
+  
+  auto monitor = std::make_shared<planning_scene_monitor::CurrentStateMonitor>(model_loader_ptr_->getModel(), tfBuffer);
+  
+  trajectory_execution_manager::TrajectoryExecutionManager trajectory_execution_manager (model_loader_ptr_->getModel(), monitor);
+  
+  // END MODIFIED ###################################################################
+
 
   // Crunch the numbers in this thread
   std::thread jogging_thread(&JogROSInterface::startJogCalcThread, this);
@@ -104,7 +136,7 @@ JogROSInterface::JogROSInterface()
     trajectory_msgs::JointTrajectory outgoing_command = shared_variables_.outgoing_command;
 
     // Check for stale cmds
-    if ((ros::Time::now() - shared_variables_.incoming_cmd_stamp) <
+    if ((ros::Time::now() - shared_variables_.latest_nonzero_cmd_stamp) <
         ros::Duration(ros_parameters_.incoming_command_timeout))
     {
       // Mark that incoming commands are not stale
@@ -122,8 +154,10 @@ JogROSInterface::JogROSInterface()
       // (trajectory_msgs/JointTrajectory or std_msgs/Float64MultiArray).
       if (ros_parameters_.command_out_type == "trajectory_msgs/JointTrajectory")
       {
+        // MODIFIED ##################################################
         outgoing_command.header.stamp = ros::Time::now();
-        outgoing_cmd_pub.publish(outgoing_command);
+        // directly pushAndExecute() the calculated command 
+        trajectory_execution_manager.pushAndExecute(outgoing_command);
       }
       else if (ros_parameters_.command_out_type == "std_msgs/Float64MultiArray")
       {
@@ -137,12 +171,12 @@ JogROSInterface::JogROSInterface()
     }
     else if (shared_variables_.command_is_stale)
     {
-      ROS_WARN_STREAM_THROTTLE_NAMED(2, LOGNAME, "Stale command. "
-                                                 "Try a larger 'incoming_command_timeout' parameter?");
+      ROS_WARN_STREAM_THROTTLE_NAMED(10, LOGNAME, "Stale command. "
+                                                  "Try a larger 'incoming_command_timeout' parameter?");
     }
     else
     {
-      ROS_DEBUG_STREAM_THROTTLE_NAMED(2, LOGNAME, "All-zero command. Doing nothing.");
+      ROS_DEBUG_STREAM_THROTTLE_NAMED(10, LOGNAME, "All-zero command. Doing nothing.");
     }
 
     pthread_mutex_unlock(&shared_variables_mutex_);
@@ -189,7 +223,7 @@ void JogROSInterface::deltaCartesianCmdCB(const geometry_msgs::TwistStampedConst
     shared_variables_.command_deltas.header.frame_id = ros_parameters_.command_frame;
   }
 
-  // Check if input is all zeros. Flag it if so to skip calculations/publication
+  // Check if input is all zeros. Flag it if so to skip calculations/publication after num_halt_msgs_to_publish
   shared_variables_.zero_cartesian_cmd_flag = shared_variables_.command_deltas.twist.linear.x == 0.0 &&
                                               shared_variables_.command_deltas.twist.linear.y == 0.0 &&
                                               shared_variables_.command_deltas.twist.linear.z == 0.0 &&
@@ -197,7 +231,10 @@ void JogROSInterface::deltaCartesianCmdCB(const geometry_msgs::TwistStampedConst
                                               shared_variables_.command_deltas.twist.angular.y == 0.0 &&
                                               shared_variables_.command_deltas.twist.angular.z == 0.0;
 
-  shared_variables_.incoming_cmd_stamp = msg->header.stamp;
+  if (!shared_variables_.zero_cartesian_cmd_flag)
+  {
+    shared_variables_.latest_nonzero_cmd_stamp = msg->header.stamp;
+  }
   pthread_mutex_unlock(&shared_variables_mutex_);
 }
 
@@ -215,7 +252,10 @@ void JogROSInterface::deltaJointCmdCB(const control_msgs::JointJogConstPtr& msg)
   };
   shared_variables_.zero_joint_cmd_flag = all_zeros;
 
-  shared_variables_.incoming_cmd_stamp = msg->header.stamp;
+  if (!shared_variables_.zero_joint_cmd_flag)
+  {
+    shared_variables_.latest_nonzero_cmd_stamp = msg->header.stamp;
+  }
   pthread_mutex_unlock(&shared_variables_mutex_);
 }
 
